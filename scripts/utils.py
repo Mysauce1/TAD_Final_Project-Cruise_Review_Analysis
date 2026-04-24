@@ -3,6 +3,7 @@ import re
 import pandas as pd
 import spacy
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+from ftfy import fix_text
 
 # Load NLP model and sentiment analyzer
 nlp = spacy.load("en_core_web_sm")
@@ -94,9 +95,21 @@ def load_jsonl(path):
                     print(f"Skipping bad line {i+1}")
                     continue
 
-            # Clean review text (remove newlines/carriage returns)
+            # Clean and fix encoding issues in review text
             if "review" in obj:
-                obj["review"] = obj["review"].replace("\n", " ").replace("\r", " ")
+                text = obj["review"].replace("\n", " ").replace("\r", " ")
+
+                # Fix encoding issues (quotes, mojibake, etc.)
+                text = fix_text(text)
+
+                # Normalize ALL dash variants (including em dash) to hyphen
+                text = re.sub(r"[–—−]", "-", text)
+
+                # Normalize smart quotes to standard quotes
+                text = re.sub(r"[“”]", '"', text)
+                text = re.sub(r"[‘’]", "'", text)
+
+                obj["review"] = text
 
             data.append(obj)
 
@@ -117,6 +130,50 @@ def split_sentences(text):
     return [sent.text.strip() for sent in doc.sents]
 
 
+def split_clauses(sentence):
+    """
+    Split sentence into clauses based on 'but'.
+
+    If 'but' exists:
+    - Split into 2 clauses
+    - Second clause may introduce a new port (port switch)
+
+    Args:
+        sentence (str): Input sentence.
+
+    Returns:
+        list: List of clause dictionaries with text and port info.
+    """
+    sentence_lower = sentence.lower()
+
+    # Split only on first occurrence of "but"
+    if " but " in sentence_lower:
+        parts = re.split(r"\bbut\b", sentence, maxsplit=1, flags=re.IGNORECASE)
+
+        first = parts[0].strip()
+        second = parts[1].strip()
+
+        first_ports = detect_ports(first)
+        second_ports = detect_ports(second)
+
+        # True if second clause introduces a new port context
+        has_switch = len(second_ports) > 0
+
+        return [
+            {"text": first, "ports": first_ports, "has_port_switch": False},
+            {"text": second, "ports": second_ports, "has_port_switch": has_switch},
+        ]
+
+    # No split needed
+    return [
+        {
+            "text": sentence.strip(),
+            "ports": detect_ports(sentence),
+            "has_port_switch": False,
+        }
+    ]
+
+
 def get_sentiment(text):
     """
     Compute sentiment using VADER.
@@ -125,6 +182,6 @@ def get_sentiment(text):
         text (str): Input text.
 
     Returns:
-        float: Compound sentiment score (-1 to 1).
+        float: compound sentiment score
     """
     return vader.polarity_scores(text)["compound"]

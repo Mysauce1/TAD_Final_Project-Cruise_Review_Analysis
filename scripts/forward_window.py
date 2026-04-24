@@ -1,8 +1,14 @@
 import os
 import pandas as pd
-from scripts.utils import load_jsonl, split_sentences, detect_ports, get_sentiment
+from scripts.utils import (
+    load_jsonl,
+    split_sentences,
+    split_clauses,
+    detect_ports,
+    get_sentiment,
+)
 
-# Obtain base directory (project root)
+# Resolve base directory (project root)
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # Input data path (JSONL file)
@@ -14,25 +20,24 @@ RESULT_DIR = os.path.join(BASE_DIR, "results", "forward_window")
 # Ensure results folder exists
 os.makedirs(RESULT_DIR, exist_ok=True)
 
-# Number of sentences to include after a port mention
+# Number of sentences to include after port mention
 WINDOW = 2
+
+# Minimum sentiment threshold for filtering noise
+MIN_SENTIMENT = 0.05
 
 
 def run():
     """
-    Execute the forward window propagation approach.
+    Execute forward window propagation approach.
 
     Logic:
-    - When a port appears, open a forward window of size WINDOW
-    - Assign sentiment from the port sentence and next WINDOW sentences
-    - Multiple windows can overlap if ports appear close together
-    - Each sentence can be assigned to multiple ports
-
-    Outputs:
-        avg_sentiment_by_port.csv: mean sentiment per port
-        detailed_output.csv: sentence-level assignments
+    - Port opens forward window
+    - Window includes current + next N sentences
+    - New port overrides previous window
     """
-    # Load dataset
+
+    # Load dataset into DataFrame
     df = load_jsonl(DATA_PATH)
 
     records = []
@@ -44,47 +49,94 @@ def run():
         # Split review into sentences
         sentences = split_sentences(row["review"])
 
-        # Store active windows as (start_index, ports)
-        active_windows = []
+        # Track active window (end index, ports)
+        active_window = None
 
         for i, sent in enumerate(sentences):
-            # Detect ports in current sentence
-            ports = detect_ports(sent)
 
-            if ports:
-                # Start a new window at this sentence index
-                active_windows.append((i, ports))
+            # Split sentence into clauses
+            clauses = split_clauses(sent)
 
-            # Compute sentiment for current sentence
-            sentiment = get_sentiment(sent)
+            for clause in clauses:
+                text = clause["text"]
+                ports = clause["ports"]
 
-            # Assign sentence to all active windows within range
-            for start_idx, ports_in_window in active_windows:
-                if start_idx <= i <= start_idx + WINDOW:
-                    for p in ports_in_window:
+                sentiment = get_sentiment(text)
+
+                # Filter weak sentiment signals
+                if abs(sentiment) < MIN_SENTIMENT:
+                    continue
+
+                # If ports are detected, start new window
+                if ports:
+                    active_window = (i + WINDOW, ports)
+
+                    for p in ports:
                         records.append(
                             {
                                 "review_id": review_id,
                                 "port": p,
-                                "sentence": sent,
+                                "sentence": text,
                                 "sentiment": sentiment,
                             }
                         )
+                    continue
+
+                # Skip if no active window exists
+                if active_window is None:
+                    continue
+
+                window_end, window_ports = active_window
+
+                # Close window if exceeded
+                if i > window_end:
+                    active_window = None
+                    continue
+
+                # Assign to active ports
+                for p in window_ports:
+                    records.append(
+                        {
+                            "review_id": review_id,
+                            "port": p,
+                            "sentence": text,
+                            "sentiment": sentiment,
+                        }
+                    )
 
     # Convert to DataFrame
     out = pd.DataFrame(records)
 
-    # Compute average sentiment per port
+    # Compute sentiment by port
     summary = out.groupby("port")["sentiment"].mean().reset_index()
     summary.rename(columns={"sentiment": "avg_sentiment"}, inplace=True)
 
-    # Save aggregated results
     summary.to_csv(os.path.join(RESULT_DIR, "avg_sentiment_by_port.csv"), index=False)
 
-    # Save detailed sentence-level results
+    # Compute port proportions
+    port_counts = out.groupby("port").size().reset_index(name="count")
+
+    total = port_counts["count"].sum()
+    port_counts["proportion"] = port_counts["count"] / total
+
+    port_counts.to_csv(os.path.join(RESULT_DIR, "port_proportions.csv"), index=False)
+
+    # Save summary stats
+    summary_stats = pd.DataFrame(
+        [
+            {
+                "total_assignments": len(out),
+                "unique_sentences": out["sentence"].nunique(),
+                "unique_reviews": out["review_id"].nunique(),
+            }
+        ]
+    )
+
+    summary_stats.to_csv(os.path.join(RESULT_DIR, "method_summary.csv"), index=False)
+
+    # Save detailed output
     out.to_csv(os.path.join(RESULT_DIR, "detailed_output.csv"), index=False)
 
 
-# Run script directly
 if __name__ == "__main__":
     run()

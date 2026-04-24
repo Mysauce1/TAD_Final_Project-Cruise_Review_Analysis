@@ -1,8 +1,14 @@
 import os
 import pandas as pd
-from scripts.utils import load_jsonl, split_sentences, detect_ports, get_sentiment
+from scripts.utils import (
+    load_jsonl,
+    split_sentences,
+    split_clauses,
+    detect_ports,
+    get_sentiment,
+)
 
-# Obtain base directory (project root)
+# Resolve base directory (project root)
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # Input data path (JSONL file)
@@ -20,15 +26,11 @@ def run():
     Execute the "until next port" propagation approach.
 
     Logic:
-    - Track the current active port(s)
-    - Assign each sentence to the most recent port until a new port appears
-    - Compute sentiment per sentence using VADER
-    - Aggregate average sentiment per port
-
-    Outputs:
-        avg_sentiment_by_port.csv: mean sentiment per port
-        detailed_output.csv: sentence-level assignments
+    - Maintain active port context
+    - Assign all sentences until a new port appears
+    - Clause splitting improves attribution granularity
     """
+
     # Load dataset into DataFrame
     df = load_jsonl(DATA_PATH)
 
@@ -41,33 +43,39 @@ def run():
         # Split review into sentences
         sentences = split_sentences(row["review"])
 
-        # Track most recent port(s)
+        # Track most recent active port(s)
         current_ports = []
 
         for sent in sentences:
-            # Detect ports mentioned in sentence
-            ports = detect_ports(sent)
 
-            if ports:
-                # Update active port(s)
-                current_ports = ports
-            elif not current_ports:
-                # Skip sentences before any port appears
-                continue
+            # Split sentence into clauses for finer-grained attribution
+            clauses = split_clauses(sent)
 
-            # Compute sentiment for sentence
-            sentiment = get_sentiment(sent)
+            for clause in clauses:
+                text = clause["text"]
+                ports = clause["ports"]
 
-            # Assign sentence to all active ports
-            for p in current_ports:
-                records.append(
-                    {
-                        "review_id": review_id,
-                        "port": p,
-                        "sentence": sent,
-                        "sentiment": sentiment,
-                    }
-                )
+                # Compute sentiment for clause
+                sentiment = get_sentiment(text)
+
+                # Update active port context if ports are detected
+                if ports:
+                    current_ports = ports
+
+                # Skip until a port context exists
+                elif not current_ports:
+                    continue
+
+                # Assign clause to active ports
+                for p in current_ports:
+                    records.append(
+                        {
+                            "review_id": review_id,
+                            "port": p,
+                            "sentence": text,
+                            "sentiment": sentiment,
+                        }
+                    )
 
     # Convert to DataFrame
     out = pd.DataFrame(records)
@@ -76,13 +84,35 @@ def run():
     summary = out.groupby("port")["sentiment"].mean().reset_index()
     summary.rename(columns={"sentiment": "avg_sentiment"}, inplace=True)
 
-    # Save aggregated results
+    # Save sentiment summary
     summary.to_csv(os.path.join(RESULT_DIR, "avg_sentiment_by_port.csv"), index=False)
 
-    # Save detailed sentence-level results
+    # Count assignments per port
+    port_counts = out.groupby("port").size().reset_index(name="count")
+
+    # Compute proportions
+    total = port_counts["count"].sum()
+    port_counts["proportion"] = port_counts["count"] / total
+
+    # Save proportions
+    port_counts.to_csv(os.path.join(RESULT_DIR, "port_proportions.csv"), index=False)
+
+    # Save method-level summary stats
+    summary_stats = pd.DataFrame(
+        [
+            {
+                "total_assignments": len(out),
+                "unique_sentences": out["sentence"].nunique(),
+                "unique_reviews": out["review_id"].nunique(),
+            }
+        ]
+    )
+
+    summary_stats.to_csv(os.path.join(RESULT_DIR, "method_summary.csv"), index=False)
+
+    # Save detailed outputs
     out.to_csv(os.path.join(RESULT_DIR, "detailed_output.csv"), index=False)
 
 
-# Run script directly
 if __name__ == "__main__":
     run()
